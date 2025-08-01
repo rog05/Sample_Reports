@@ -1,0 +1,309 @@
+!pip install pdfplumber sentence-transformers
+
+
+
+import pdfplumber
+import pandas as pd
+import re
+from sentence_transformers import SentenceTransformer, util
+
+# ========== CONFIG ==========
+pdf_path = "/content/TATA.pdf" # Your input PDF
+output_excel = "/content/TATA().xlsx" # Your output Excel
+
+# Headings for substring fallback match (uppercase for case-insensitive)
+STANDALONE_HEADINGS = [
+    "STANDALONE BALANCE SHEET",
+    "BALANCE SHEET AS AT",
+    "STANDALONE STATEMENT OF PROFIT AND LOSS",
+    "STATEMENT OF PROFIT & LOSS FOR THE YEAR ENDED ON 31ST MARCH",
+    "PROFIT & LOSS STATEMENT FOR THE YEAR ENDED 31ST MARCH",
+    "STANDALONE STATEMENT OF CASH FLOWS",
+    "Standalone Statement of Cashflows",
+    "STANDALONE CASH FLOW STATEMENT",
+    "BALANCE SHEET AS AT 31ST MARCH",
+    "STANDALONE STATEMENT OF PROFIT & LOSS",
+    "STANDALONE STATEMENT OF FINANCIAL POSITION",
+    "CASH FLOW STATEMENT FOR THE YEAR ENDED 31ST MARCH",
+    "STANDALONE STATEMENT OF FINANCIAL POSITION",
+    "STANDALONE PROFIT AND LOSS ACCOUNT",
+    "CASH FLOW STATEMENT FOR THE YEAR",
+    "Standalone Statement of Cash Flow",
+    "STANDALONE STATEMENT OF PROFIT AND LOSS FOR THE YEAR ENDED MARCH 31",
+    "STATEMENT OF PROFIT & LOSS FOR THE YEAR ENDED",
+    "CASH FLOW STATEMENT FOR THE YEAR ENDED",
+    "STATEMENT OF PROFIT AND LOSS FOR THE YEAR",
+    "Cash Flow Statement for the year",
+    "STATEMENT OF CASH FLOWS FOR THE YEAR"
+]
+
+CONSOLIDATED_HEADINGS = [
+    "CONSOLIDATED BALANCE SHEET",
+    "CONSOLIDATED STATEMENT OF PROFIT AND LOSS",
+    "CONSOLIDATED PROFIT & LOSS STATEMENT",
+    "CONSOLIDATED STATEMENT OF CASH FLOWS",
+    "Consolidated Statement of Cashflows",
+    "CONSOLIDATED CASH FLOW STATEMENT",
+    "Consolidated Statement of Cash Flow",
+    "CONSOLIDATED STATEMENT OF PROFIT & LOSS",
+    "CONSOLIDATED STATEMENT OF FINANCIAL POSITION",
+    "CONSOLIDATED PROFIT AND LOSS ACCOUNT",
+    "ConsoLIdAtIon stAtement of CAsh fLoW for the yeAr ended"
+]
+
+# uppercase for case-insensitive matching
+STANDALONE_HEADINGS = [h.upper() for h in STANDALONE_HEADINGS]
+CONSOLIDATED_HEADINGS = [h.upper() for h in CONSOLIDATED_HEADINGS]
+
+# NLP archetypes for semantic similarity
+ARCTYPE_HEADINGS = {
+    "Standalone Balance Sheet": [
+        "standalone balance sheet",
+        "BALANCE SHEET AS AT MARCH",
+        "standalone statement of financial position",
+        "balance sheet (standalone)",
+        "balance sheet as at"
+    ],
+    "Standalone Profit and Loss": [
+        "standalone profit and loss",
+        "standalone statement of profit and loss",
+        "standalone income statement",
+        "standalone profit & loss",
+        "STATEMENT OF PROFIT & LOSS FOR THE YEAR"
+    ],
+    "Standalone Cash Flow": [
+        "standalone cash flow",
+        "Standalone Statement of Cash Flow",
+        "standalone statement of cash flows",
+        "standalone cashflow statement",
+        "CASH FLOW STATEMENT FOR THE YEAR",
+        "Cash Flow Statement for the year",
+        "Standalone Statement of Cashflows"
+    ],
+    "Consolidated Balance Sheet": [
+        "consolidated balance sheet",
+        "balance sheet (consolidated)"
+    ],
+    "Consolidated Profit and Loss": [
+        "consolidated profit and loss",
+        "consolidated statement of profit and loss",
+        "consolidated income"
+    ],
+    "Consolidated Cash Flow": [
+        "consolidated cash flow",
+        "Consolidated Statement of Cash Flow",
+        "ConsoLIdAtIon stAtement of CAsh fLoW for the yeAr ended",
+        "consolidated statement of cash flows",
+        "Consolidated Statement of Cashflows",
+        "consolidated cashflow"
+    ]
+}
+
+# flatten archetype heading texts and labels for embedding
+archetype_texts = []
+archetype_labels = []
+for label, variants in ARCTYPE_HEADINGS.items():
+    for variant in variants:
+        archetype_texts.append(variant.lower())
+        archetype_labels.append(label)
+
+# load model and precompute archetype embeddings
+model = SentenceTransformer('all-MiniLM-L6-v2')
+archetype_embs = model.encode(archetype_texts, convert_to_tensor=True)
+
+# Regexes for detecting notes and values in data rows
+NOTE_RE = re.compile(r'^\d+([a-zA-Z])?(\(\w+\))?(\.\d+)?([a-zA-Z]?)?$|^\d+\.\d+(\([a-zA-Z0-9]+\))?$|^\d+\([a-zA-Z0-9]+\)$')
+VALUE_RE = re.compile(r'^\(?-?[\d,]+(?:\.\d+)?\)?$|^-$')
+
+# Function to fallback substring matching
+def matches_heading(text, heading_list):
+    if not text:
+        return None
+    lines = text.splitlines()
+    for line in lines[:20]:
+        line_upper = line.strip().upper()
+        for heading in heading_list:
+            if heading in line_upper:
+                return heading
+    return None
+
+def is_likely_real_section(page_text, n_lines=12):
+    lines = page_text.splitlines()[:n_lines]
+    joined = " ".join(lines).lower()
+    table_headers = [
+        "particulars", "Revenue from Operations", "as at", "for the year ended",
+        "assets", "non-current assets"
+    ]
+    found_table = any(h.lower() in joined for h in table_headers)
+    noisy = any(x in joined for x in [
+        "table of contents", "responsibility", "the following are the amounts",
+        "corporate social responsibility","as previously reported", "summary",
+        "index", "auditor", "schedule", "net liability", "(cid:20)",
+        "net liability recognized in the consolidated balance sheet as at 31 march"
+    ])
+    return found_table and not noisy
+
+def nlp_section_label_with_score(page_text, threshold=0.90, relative_threshold=0.07):
+    if not page_text:
+        return None, 0.0
+    lines = page_text.splitlines()
+    candidate_text = " ".join(lines[:16]).lower()  # Use first 16 lines to cover long headers
+    emb = model.encode(candidate_text, convert_to_tensor=True)
+    similarities = util.pytorch_cos_sim(emb, archetype_embs)[0]
+    scores = similarities.cpu().numpy()
+    sorted_idx = scores.argsort()[::-1]
+    best_idx, second_idx = sorted_idx[:2]
+    best_score, second_score = scores[best_idx], scores[second_idx]
+    if best_score >= threshold and (best_score - second_score) >= relative_threshold:
+        return archetype_labels[best_idx], best_score
+    return None, best_score
+
+def find_years_in_text(lines):
+    # Collect all visible header lines first (up to and including the first line containing both "AS AT" and a year)
+    year_regex = r'(?:as at\s*)?(?:\d{1,2}|[a-zA-Z]{3,9})\s*\w+\s*\d{2,4}'
+    year_candidates = []
+
+    # Flatten all candidate year-like tokens from all header lines (up to e.g. 7 lines)
+    for i,line in enumerate(lines[:15]):
+        # Find all possible date/y-labels (e.g. March 31, 2024) in line (not just strictly DD MMM YYYY)
+        # Capture with a broader pattern that includes "As at March 31, 2024" and "March 31, 2024"
+        found = re.findall(r"(?:as at\s*)?([A-Za-z]+\s*\d{1,2},\s*\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4}|[A-Za-z]+\s+\d{4})", line, re.I)
+        for y in found:
+            y_clean = re.sub("^as at\s*", "", y, flags=re.I).strip()
+            if y_clean and y_clean not in year_candidates:
+                year_candidates.append(y_clean)
+        # Stop condition: if the line probably lists both year columns, stop
+        if len(year_candidates) >= 2:
+            break
+
+    # Fallback: try to expand search if year columns are not both found
+    if len(year_candidates) < 2:
+        for i,line in enumerate(lines[:12]):
+            found = re.findall(r"(?:as at\s*)?([A-Za-z]+\s*\d{1,2},\s*\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4}|[A-Za-z]+\s+\d{4})", line, re.I)
+            for y in found:
+                y_clean = re.sub("^as at\s*", "", y, flags=re.I).strip()
+                if y_clean and y_clean not in year_candidates:
+                    year_candidates.append(y_clean)
+            if len(year_candidates) >= 2:
+                break
+
+    # If still not found, return default
+    if len(year_candidates) >= 2:
+        return year_candidates[:2]
+    return ["Year1", "Year2"]
+
+def parse_financial_lines(lines, year_cols, cashflow_section=False):
+    data = []
+    for line in lines:
+        line = re.sub(r'\s+', ' ', line.strip())
+        if not line:
+            continue
+        tokens = line.split(' ')
+        n = len(tokens)
+        particulars = ''
+        note = ''
+        year1 = ''
+        year2 = ''
+        if n >= 2 and VALUE_RE.fullmatch(tokens[-1]) and VALUE_RE.fullmatch(tokens[-2]):
+            if n >= 3 and NOTE_RE.fullmatch(tokens[-3]):
+                particulars = ' '.join(tokens[:-3])
+                note = tokens[-3]
+            else:
+                particulars = ' '.join(tokens[:-2])
+                note = ''
+            year1 = tokens[-2]
+            year2 = tokens[-1]
+        elif n >= 1 and VALUE_RE.fullmatch(tokens[-1]):
+            particulars = ' '.join(tokens[:-1])
+            note = ''
+            year1 = tokens[-1]
+            year2 = ''
+        elif n >= 1 and NOTE_RE.fullmatch(tokens[-1]):
+            particulars = ' '.join(tokens[:-1])
+            note = tokens[-1]
+            year1 = ''
+            year2 = ''
+        else:
+            particulars = line
+            note = ''
+            year1 = ''
+            year2 = ''
+        if cashflow_section:
+            note = ''
+        data.append({
+            "Particulars": particulars.strip(),
+            "Notes": note,
+            year_cols[0]: year1,
+            year_cols[1]: year2
+        })
+    return pd.DataFrame(data)
+
+# Main data collector
+extracted_data = {"Standalone": [], "Consolidated": []}
+
+with pdfplumber.open(pdf_path) as pdf:
+    for i, page in enumerate(pdf.pages):
+        text = page.extract_text()
+        if not text:
+            continue
+        page_num = i + 1
+
+        # NLP + relative confidence section labeling
+        label, score = nlp_section_label_with_score(text, threshold=0.90, relative_threshold=0.07)
+
+        # Fallback to substring if NLP uncertain
+        if label is None:
+            if matches_heading(text, STANDALONE_HEADINGS):
+                label = "Standalone"
+                score = 1.0
+            elif matches_heading(text, CONSOLIDATED_HEADINGS):
+                label = "Consolidated"
+                score = 1.0
+
+        # Filter only real section pages
+        if label and is_likely_real_section(text, n_lines=12):
+            lines = text.splitlines()
+
+            # Extract years dynamically
+            year_cols = find_years_in_text(lines)
+
+            # Find header line for data start (where "Particulars" and both year cols appear)
+            header_idx = None
+            for idx, line in enumerate(lines):
+                if "PARTICULARS" in line.upper() and all(y in line for y in year_cols):
+                    header_idx = idx
+                    break
+            if header_idx is None:
+                header_idx = 5  # fallback
+
+            data_lines = lines[header_idx + 1:]
+
+            # Check if cashflow (to blank notes)
+            cashflow_section = "cash flow" in (label or '').lower()
+
+            # Parse data into a DataFrame
+            df = parse_financial_lines(data_lines, year_cols, cashflow_section)
+
+            if label.lower().startswith("standalone"):
+                extracted_data["Standalone"].append((label, df))
+                print(f"Page {page_num}: Detected '{label}' (confidence {score:.3f})\n")
+            elif label.lower().startswith("consolidated"):
+                extracted_data["Consolidated"].append((label, df))
+                print(f"Page {page_num}: Detected '{label}' (confidence {score:.3f})\n")
+
+# Export to Excel one sheet per section type with headers preserved
+with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+    for section, items in extracted_data.items():
+        if not items:
+            continue
+        sheet_name = section[:31]
+        start_row = 0
+        for heading, df in items:
+            worksheet = writer.book[sheet_name] if sheet_name in writer.book.sheetnames else writer.book.create_sheet(sheet_name)
+            header_cell = worksheet.cell(row=start_row+1, column=1)
+            header_cell.value = heading
+            header_cell.font = header_cell.font.copy(bold=True)
+            df.to_excel(writer, sheet_name=sheet_name, startrow=start_row + 1, index=False)
+            start_row += len(df) + 3
+
+print(f"\nExtraction complete! Data saved to '{output_excel}'")
